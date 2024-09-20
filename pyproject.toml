@@ -16,7 +16,7 @@ classifiers = [
 [tool.maturin]
 python-source = "python"
 module-name = "rebop.rebop"
-features = ["pyo3/extension-module"]
+features = ["pyo3/extension-module", "rebop/pylib"]
 
 [tool.ruff]
 extend-exclude = ["benches/*"]

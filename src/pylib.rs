@@ -230,11 +230,164 @@
 //! * [SmartCell](http://software.crg.es/smartcell/)
 //! * [NFsim](http://michaelsneddon.net/nfsim/)
 
+use pyo3::prelude::*;
+use std::collections::HashMap;
+
 pub use rand;
 pub use rand_distr;
 
-pub mod gillespie;
-mod gillespie_macro;
+use crate::gillespie;
 
-#[cfg(feature="pylib")]
-pub mod pylib;
+/// Reaction system composed of species and reactions.
+#[pyclass]
+struct Gillespie {
+    species: HashMap<String, usize>,
+    reactions: Vec<(f64, Vec<String>, Vec<String>)>,
+}
+
+#[pymethods]
+impl Gillespie {
+    #[new]
+    fn new() -> Self {
+        Gillespie {
+            species: HashMap::new(),
+            reactions: Vec::new(),
+        }
+    }
+    /// Number of species currently in the system
+    fn nb_species(&self) -> PyResult<usize> {
+        Ok(self.species.len())
+    }
+    /// Add a Law of Mass Action reaction to the system.
+    ///
+    /// The forward reaction rate is `rate`, while `reactants` and `products` are lists of
+    /// respectively reactant names and product names.  Add the reverse reaction with the rate
+    /// `reverse_rate` if it is not `None`.
+    #[pyo3(signature = (rate, reactants, products, reverse_rate=None))]
+    fn add_reaction(
+        &mut self,
+        rate: f64,
+        reactants: Vec<String>,
+        products: Vec<String>,
+        reverse_rate: Option<f64>,
+    ) -> PyResult<()> {
+        // Insert unknown reactants in known species
+        for reactant in &reactants {
+            if !self.species.contains_key(reactant) {
+                self.species.insert(reactant.clone(), self.species.len());
+            }
+        }
+        // Insert unknown products in known species
+        for product in &products {
+            if !self.species.contains_key(product) {
+                self.species.insert(product.clone(), self.species.len());
+            }
+        }
+        self.reactions
+            .push((rate, reactants.clone(), products.clone()));
+        if let Some(rrate) = reverse_rate {
+            self.reactions.push((rrate, products, reactants));
+        }
+        Ok(())
+    }
+    /// Number of reactions currently in the system.
+    fn nb_reactions(&self) -> PyResult<usize> {
+        Ok(self.reactions.len())
+    }
+    /// Run the system until `tmax` with `nb_steps` steps.
+    ///
+    /// The initial configuration is specified in the dictionary `init`.
+    /// Returns `times, vars` where `times` is an array of `nb_steps + 1` uniformly spaced time
+    /// points between `0` and `tmax`, and `vars` is a dictionary of species name to array of
+    /// values at the given time points.  One can specify a random `seed` for reproducibility.
+    /// If `nb_steps` is `0`, then returns all reactions, ending with the first that happens at
+    /// or after `tmax`.
+    #[pyo3(signature = (init, tmax, nb_steps, seed=None))]
+    fn run(
+        &self,
+        init: HashMap<String, usize>,
+        tmax: f64,
+        nb_steps: usize,
+        seed: Option<u64>,
+    ) -> PyResult<(Vec<f64>, HashMap<String, Vec<isize>>)> {
+        let mut x0 = vec![0; self.species.len()];
+        for (name, &value) in &init {
+            if let Some(&id) = self.species.get(name) {
+                x0[id] = value as isize;
+            }
+        }
+        let mut g = match seed {
+            Some(seed) => gillespie::Gillespie::new_with_seed(x0, seed),
+            None => gillespie::Gillespie::new(x0),
+        };
+
+        for (rate, reactants, products) in self.reactions.iter() {
+            let mut vreactants = vec![0; self.species.len()];
+            for reactant in reactants {
+                vreactants[self.species[reactant]] += 1;
+            }
+            let rate = gillespie::Rate::lma(*rate, vreactants);
+            let mut actions = vec![0; self.species.len()];
+            for reactant in reactants {
+                actions[self.species[reactant]] -= 1;
+            }
+            for product in products {
+                actions[self.species[product]] += 1;
+            }
+            g.add_reaction(rate, actions);
+        }
+        let mut times = Vec::new();
+        // species.shape = (species, nb_steps)
+        let mut species = vec![Vec::new(); self.species.len()];
+        if nb_steps > 0 {
+            for i in 0..=nb_steps {
+                let t = tmax * i as f64 / nb_steps as f64;
+                times.push(t);
+                g.advance_until(t);
+                for s in 0..self.species.len() {
+                    species[s].push(g.get_species(s));
+                }
+            }
+        } else {
+            // nb_steps = 0: we return every step
+            let mut rates = vec![f64::NAN; g.nb_reactions()];
+            times.push(g.get_time());
+            for s in 0..self.species.len() {
+                species[s].push(g.get_species(s));
+            }
+            while g.get_time() < tmax {
+                g._advance_one_reaction(&mut rates);
+                times.push(g.get_time());
+                for s in 0..self.species.len() {
+                    species[s].push(g.get_species(s));
+                }
+            }
+        }
+        let mut result = HashMap::new();
+        for (name, &id) in &self.species {
+            result.insert(name.clone(), species[id].clone());
+        }
+        Ok((times, result))
+    }
+    fn __str__(&self) -> PyResult<String> {
+        let mut s = format!(
+            "{} species and {} reactions\n",
+            self.species.len(),
+            self.reactions.len()
+        );
+        for (rate, reactants, products) in &self.reactions {
+            s.push_str(&reactants.join(" + "));
+            s.push_str(" --> ");
+            s.push_str(&products.join(" + "));
+            s.push_str(&format!(" @ {}\n", rate));
+        }
+        Ok(s)
+    }
+}
+
+#[pymodule]
+fn rebop(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    m.add_class::<Gillespie>()?;
+    Ok(())
+}
